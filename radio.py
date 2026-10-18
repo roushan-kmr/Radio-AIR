@@ -8,6 +8,8 @@ On every start it:
      If that file does not exist, a sample is created.
   3. Syncs favourites.json: each favourite keeps its stream URL, and the URL
      is updated automatically if a channel's address changed.
+  4. Auto Play (button on the page, state kept in AutoPlay.txt): when ON, the
+     last channel that was playing is started again after a reboot or restart.
 
 Streams are played with mpv on the Pi (through its default audio output).
 
@@ -20,6 +22,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +40,7 @@ PAGE_FILE = Path.home() / "live.html"
 SOURCE_URL = "https://akashvani.gov.in/radio/live.php"
 FAV_FILE = BASE / "favorites.json"
 CUSTOM_FILE = BASE / "NonAIRchannels.txt"
+AUTOPLAY_FILE = BASE / "AutoPlay.txt"
 PORT = 8000
 DEAD_HOSTS = ("air.pc.cdn.bitgravity.com",)  # these returned 404
 PATTERN = re.compile(
@@ -56,8 +60,10 @@ SAMPLE = '''# Non-AIR radio channels
 
 STATIONS = []
 FAVS = {}  # channel name -> stream URL
+AUTO = {"autoplay": False, "last": "", "playing": False}
 LOCK = threading.Lock()
 FAV_LOCK = threading.Lock()
+AUTO_LOCK = threading.Lock()
 PROC = None
 CURRENT = None
 
@@ -196,6 +202,81 @@ def toggle_fav(station_id):
         return s["name"] in FAVS
 
 
+# ---------------------------------------------------------------- auto play
+def save_auto():
+    text = (
+        "# Written by radio.py. You can edit it while radio.py is stopped.\n"
+        f"autoplay={'on' if AUTO['autoplay'] else 'off'}\n"
+        f"last={AUTO['last']}\n"
+        f"playing={'yes' if AUTO['playing'] else 'no'}\n"
+    )
+    try:
+        AUTOPLAY_FILE.write_text(text, encoding="utf-8")
+    except OSError as e:
+        print(f"Could not write {AUTOPLAY_FILE.name}: {e}")
+
+
+def load_auto():
+    if not AUTOPLAY_FILE.exists():
+        save_auto()
+        return
+    values = {}
+    for line in AUTOPLAY_FILE.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            values[k.strip().lower()] = v.strip()
+    AUTO["autoplay"] = values.get("autoplay", "off").lower() in ("on", "yes", "true", "1")
+    AUTO["last"] = values.get("last", "")
+    AUTO["playing"] = values.get("playing", "no").lower() in ("yes", "on", "true", "1")
+
+
+def remember(name=None, playing=None):
+    """Record the last channel and whether it was playing (not stopped by you)."""
+    with AUTO_LOCK:
+        if name is not None:
+            AUTO["last"] = name
+        if playing is not None:
+            AUTO["playing"] = playing
+        save_auto()
+
+
+def toggle_autoplay():
+    with AUTO_LOCK:
+        AUTO["autoplay"] = not AUTO["autoplay"]
+        if AUTO["autoplay"] and CURRENT and PROC is not None and PROC.poll() is None:
+            AUTO["last"] = CURRENT
+            AUTO["playing"] = True
+        save_auto()
+        return AUTO["autoplay"]
+
+
+def resume_last():
+    """After a start or reboot, play the last channel if Auto Play is on."""
+    with AUTO_LOCK:
+        wanted = AUTO["autoplay"] and AUTO["playing"] and AUTO["last"]
+        name = AUTO["last"]
+    if not wanted:
+        return
+    ids = {s["name"]: s["id"] for s in STATIONS}
+    if name not in ids:
+        print(f"Auto play: last channel not in the list now: {name}")
+        return
+    # Right after boot the network or audio may not be ready, so retry a few times.
+    for attempt in range(1, 7):
+        print(f"Auto play: starting {name} (attempt {attempt})")
+        if not play(ids[name]):
+            return
+        mine = PROC
+        time.sleep(8)
+        if PROC is not mine:  # you stopped it or picked another channel
+            return
+        if mine is not None and mine.poll() is None:
+            return
+        time.sleep(4)
+    print("Auto play: gave up (stream or audio not available)")
+
+
 # ------------------------------------------------------------------ player
 def stop_player():
     global PROC, CURRENT
@@ -224,12 +305,14 @@ def play(station_id):
             stderr=subprocess.DEVNULL,
         )
         CURRENT = s["name"]
+    remember(name=s["name"], playing=True)
     return True
 
 
 def status():
     running = PROC is not None and PROC.poll() is None
-    return {"playing": CURRENT if running else None}
+    return {"playing": CURRENT if running else None,
+            "autoplay": AUTO["autoplay"]}
 
 
 def change_volume(direction):
@@ -252,7 +335,7 @@ PAGE = """<!doctype html>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, sans-serif; background: #121212;
-         color: #eee; padding-bottom: 130px; }
+         color: #eee; padding-bottom: 190px; }
   header { position: sticky; top: 0; background: #121212; padding: 12px; z-index: 2;
            display: flex; gap: 8px; }
   input { flex: 1; min-width: 0; padding: 12px; font-size: 16px; border-radius: 10px;
@@ -274,6 +357,8 @@ PAGE = """<!doctype html>
            background: #333; color: #eee; }
   button.stop { background: #8b2b2b; }
   #refresh { flex: 0 0 52px; padding: 0; font-size: 22px; }
+  button.auto { width: 100%; margin-bottom: 8px; padding: 12px; }
+  button.auto.on { background: #2e7d32; }
 </style></head>
 <body>
 <header>
@@ -283,6 +368,7 @@ PAGE = """<!doctype html>
 <ul id="list"></ul>
 <footer>
   <div id="now">Nothing playing</div>
+  <button id="auto" class="auto">Auto Play: OFF</button>
   <div class="row">
     <button id="vdown">Vol -</button>
     <button id="stop" class="stop">Stop</button>
@@ -338,12 +424,18 @@ function render() {
     rest.forEach(s => list.appendChild(row(s)));
   }
 }
+function setAuto(on) {
+  const b = document.getElementById('auto');
+  b.className = 'auto' + (on ? ' on' : '');
+  b.textContent = 'Auto Play: ' + (on ? 'ON' : 'OFF');
+}
 async function loadStations() {
   stations = await (await fetch('/api/stations')).json();
 }
 async function refreshStatus() {
   const r = await (await fetch('/api/status')).json();
   playing = r.playing;
+  setAuto(r.autoplay);
   now.textContent = playing ? 'Playing: ' + playing : 'Nothing playing';
   render();
 }
@@ -351,6 +443,10 @@ async function post(path) { await fetch(path, {method: 'POST'}); refreshStatus()
 document.getElementById('stop').onclick = () => post('/api/stop');
 document.getElementById('vup').onclick = () => post('/api/vol/up');
 document.getElementById('vdown').onclick = () => post('/api/vol/down');
+document.getElementById('auto').onclick = async () => {
+  const r = await (await fetch('/api/autoplay', {method: 'POST'})).json();
+  setAuto(r.autoplay);
+};
 document.getElementById('q').oninput = render;
 document.getElementById('refresh').onclick = async () => {
   now.textContent = 'Reloading channel list...';
@@ -410,7 +506,10 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/stop":
             with LOCK:
                 stop_player()
+            remember(playing=False)  # stopped by you, so do not resume at boot
             self.send(200, json.dumps({"ok": True}))
+        elif p == "/api/autoplay":
+            self.send(200, json.dumps({"ok": True, "autoplay": toggle_autoplay()}))
         elif p in ("/api/vol/up", "/api/vol/down"):
             change_volume(p.rsplit("/", 1)[1])
             self.send(200, json.dumps({"ok": True}))
@@ -429,8 +528,11 @@ if __name__ == "__main__":
     load_stations(refresh=True)
     load_favs()
     sync_favs()
-    print(f"{len(STATIONS)} channels, {len(FAVS)} favourites. "
+    load_auto()
+    print(f"{len(STATIONS)} channels, {len(FAVS)} favourites, "
+          f"auto play {'ON' if AUTO['autoplay'] else 'OFF'}. "
           f"Open http://<PI_IP>:{PORT}")
+    threading.Thread(target=resume_last, daemon=True).start()
     try:
         ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
     finally:
